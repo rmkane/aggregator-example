@@ -1,0 +1,8 @@
+[submodule "demo-submodule-a"]
+	path = demo-submodule-a
+	url = git@github.com:rmkane/demo-submodule-a.git
+	branch = develop
+[submodule "demo-submodule-b"]
+	path = demo-submodule-b
+	url = git@github.com:rmkane/demo-submodule-b.git
+	branch = develop
