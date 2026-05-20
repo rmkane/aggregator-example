@@ -197,15 +197,23 @@ remove_submodule_registration() {
   run rm -rf ".git/modules/${path}"
 
   if [[ -f .gitmodules ]]; then
-    git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
-    if [[ -f .gitmodules ]] && ! git config -f .gitmodules --list >/dev/null 2>&1; then
-      git rm -f .gitmodules
+    # FIX: route through run() so dry-run captures these steps too.
+    run git config -f .gitmodules --remove-section "submodule.${name}"
+
+    # FIX: count remaining submodule keys rather than relying on --list exit
+    # code, which also fails on whitespace-only or comment-only files and would
+    # silently delete a partially-valid .gitmodules.
+    local remaining
+    remaining=$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l || echo 0)
+    if [[ "$remaining" -eq 0 ]]; then
+      run git rm -f .gitmodules
     else
-      git add .gitmodules
+      run git add .gitmodules
     fi
   fi
 
-  git config --remove-section "submodule.${name}" 2>/dev/null || true
+  # FIX: route through run() so dry-run captures this step too.
+  run git config --remove-section "submodule.${name}" 2>/dev/null || true
 }
 
 absorb_one() {
@@ -245,18 +253,34 @@ absorb_one() {
 
   import_ref="$(resolve_import_ref "$remote_name" "$path")"
   log "    import ref:        ${import_ref}"
+
+  # FIX: verify the import ref *before* any destructive steps. If the ref is
+  # bad at this point (bad fetch, server restriction, etc.) the submodule
+  # registration would already have been removed, leaving the tree in a
+  # half-absorbed state with no easy recovery.
   verify_import_ref "$import_ref"
 
   remove_submodule_registration "$name" "$path"
 
   if ! git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"; then
-    log "Error: merge failed. Clean up with: git merge --abort" >&2
+    # cleanup_on_exit handles the remote; advise on the merge state only.
+    log "Error: merge failed. Run: git merge --abort" >&2
     exit 1
   fi
 
+  # FIX: surface a clear recovery hint if read-tree fails. At this point the
+  # merge has been staged; aborting the merge and hard-resetting HEAD restores
+  # the index and working tree to the pre-absorb state for this submodule.
   log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
-  git read-tree --prefix="${path}/" -u "$import_ref"
+  git read-tree --prefix="${path}/" -u "$import_ref" || {
+    log "Error: read-tree failed." >&2
+    log "       Run: git merge --abort" >&2
+    exit 1
+  }
 
+  # FIX: only emit the pinned-SHA line when it is actually set (i.e. not using
+  # --branch mode), so the commit message does not contain a trailing blank line
+  # when IMPORT_BRANCH is set and pinned_line is empty.
   local pinned_line=""
   if [[ -z "$IMPORT_BRANCH" && -n "$pinned_sha" ]]; then
     pinned_line="Original pinned gitlink SHA: ${pinned_sha}"
@@ -267,8 +291,7 @@ Absorb submodule ${name} into monorepo
 
 Import history from ${url} at ${path}/.
 Import ref: ${import_ref}
-${pinned_line}
-
+${pinned_line:+"${pinned_line}"}
 Removes submodule link; directory is now part of this repository.
 EOF
 )"
@@ -329,19 +352,24 @@ main() {
   trap cleanup_on_exit EXIT
   require_clean_tree
 
-  local names=() paths=()
+  local names=()
   local name path
 
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     names+=("$name")
-    paths+=("$(submodule_path "$name")")
   done < <(submodule_names)
 
   [[ ${#names[@]} -gt 0 ]] || {
     log "No submodules defined in .gitmodules — nothing to do."
     exit 0
   }
+
+  # FIX: warn explicitly when .gitmodules exists but yielded no submodule
+  # paths, which most likely indicates a malformed or partially-edited file.
+  if [[ -f .gitmodules && ${#names[@]} -eq 0 ]]; then
+    log "Warning: .gitmodules exists but no submodule paths were found. Malformed?" >&2
+  fi
 
   log "Repository: ${ROOT}"
   log "Submodules to absorb: ${names[*]}"
@@ -353,8 +381,13 @@ main() {
     sleep 5
   fi
 
+  # Absorb each submodule and collect its resolved path for the final summary.
+  # The paths array is built here rather than upfront so it stays in sync with
+  # the names that were actually processed.
+  local paths=()
   for name in "${names[@]}"; do
     absorb_one "$name"
+    paths+=("$(git config -f .gitmodules --get "submodule.${name}.path" 2>/dev/null || echo "$name")")
   done
 
   log ""
