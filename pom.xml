@@ -2,12 +2,21 @@
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.example</groupId>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent-pom</artifactId>
+        <version>${revision}</version>
+        <relativePath>parent-pom/pom.xml</relativePath>
+    </parent>
+
     <artifactId>aggregator-example</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
 
+    <name>Aggregator Example</name>
+    <description>Aggregator Example</description>
+
     <modules>
+        <module>parent-pom</module>
         <module>demo-submodule-a</module>
         <module>demo-submodule-b</module>
     </modules>
