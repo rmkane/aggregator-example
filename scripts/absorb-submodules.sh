@@ -316,30 +316,6 @@ resolve_import_ref() {
   printf '%s\n' "$commit"
 }
 
-# Remove all .gitmodules and .git/config references to the named submodule.
-# Both git config calls are run directly (not via run_cmd) with 2>/dev/null
-# and explicit exit-code handling. This is necessary because set -e fires
-# inside run_cmd before the || true on the call site can catch a non-zero exit
-# from git. deinit often removes these sections first, so missing section is
-# a normal and expected condition, not an error.
-remove_gitconfig_sections() {
-  local name="$1"
-
-  if $DRY_RUN; then
-    log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
-    log "[dry-run] git config --remove-section submodule.${name}"
-    return 0
-  fi
-
-  # Temporarily disable set -e around these calls. Both || true and subshell
-  # "; true" patterns are unreliable under Bash 3.2 set -e inside functions.
-  # Explicitly toggling errexit is the only portable guarantee.
-  set +e
-  git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
-  git config --remove-section "submodule.${name}" 2>/dev/null
-  set -e
-}
-
 remove_submodule_registration() {
   local name="$1"
   local path="$2"
@@ -348,11 +324,23 @@ remove_submodule_registration() {
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
 
-  # Update .gitmodules: remove this submodule's section, then either delete
-  # the file entirely if no submodules remain or stage the updated version.
-  if [[ -f .gitmodules ]]; then
-    remove_gitconfig_sections "$name"
+  # Remove submodule sections from .gitmodules and .git/config.
+  # deinit often removes these sections first so "missing section" is normal.
+  # set +e / set -e is used directly here — || true, subshell "; true", and
+  # set +e inside a called function are all unreliable under Bash 3.2 set -e.
+  if $DRY_RUN; then
+    log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
+    log "[dry-run] git config --remove-section submodule.${name}"
+  else
+    set +e
+    git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
+    git config --remove-section "submodule.${name}" 2>/dev/null
+    set -e
+  fi
 
+  # Update .gitmodules: either delete the file entirely if no submodules
+  # remain or stage the updated version.
+  if [[ -f .gitmodules ]]; then
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     # wc -l returns 0 on empty input; tr -d strips BSD/macOS leading whitespace.
     local remaining
@@ -368,9 +356,6 @@ remove_submodule_registration() {
     else
       run_cmd git add .gitmodules
     fi
-  else
-    # .gitmodules already gone (deinit removed it); still clean up .git/config.
-    remove_gitconfig_sections "$name"
   fi
 }
 
