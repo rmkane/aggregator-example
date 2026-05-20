@@ -39,12 +39,27 @@
 #     git log --all -- <path>/
 #   For a single file (including renames): git log --follow -- <path>/file
 #
+# Behavior
+#   - Default import is the submodule commit pinned at HEAD (the gitlink), not
+#     the branch named in .gitmodules. Use -b/--branch to import a branch tip.
+#   - Creates one commit per submodule. Partial migration: --submodule NAME.
+#   - Fetches and verifies the import ref before removing submodule metadata,
+#     so a failed fetch does not leave the repo half-absorbed.
+#   - Dry-run (-n) prints a step-by-step preview only; no git commands run.
+#   - Registers temporary remotes named absorb-import-<submodule>; removed on
+#     success and on normal exit (trap). SIGKILL may leave one behind — see below.
+#   - Refuses to absorb a path that is not a gitlink at HEAD (already absorbed).
+#   - Some remotes block direct SHA fetch; the script retries with a full fetch.
+#     If verification still fails, try absorb -b <branch>.
+#
 # Limitations
 #   - Submodule paths containing spaces are not supported.
-#   - If interrupted, re-run after cleaning any leftover absorb-import-* remote
-#     (git remote list); the script also removes them on exit when possible.
+#   - If interrupted (especially SIGKILL), check for leftover absorb-import-*
+#     remotes (git remote) and remove them before re-running.
+#   - Submodule tags are not imported into the parent repo (--no-tags on fetch).
 #
 # ShellCheck
+#   Run from the scripts/ directory (the command below is the filename only):
 #   It is recommended to run ShellCheck against this script in CI or as a
 #   pre-commit hook to catch shell-specific issues early:
 #     `shellcheck absorb-submodules.sh`
@@ -100,8 +115,12 @@ Options:
 Notes:
   - Requires bash 3.2+ (macOS /bin/bash and bash 4.x are supported).
   - Default import uses the gitlink SHA at HEAD, not the branch in .gitmodules.
-  - Creates one commit per submodule. Requires a clean working tree.
+  - Verifies the import ref before removing submodule metadata (safe on fetch failure).
+  - Dry-run prints a preview only; no git commands are executed.
+  - One commit per submodule. Requires a clean working tree.
+  - Cannot re-run on a path already absorbed (not a gitlink at HEAD).
   - Verify history with: git log --all -- <path>/
+  - See script header for full behavior, limitations, and ShellCheck usage.
 
 Examples:
   $0 absorb --dry-run
@@ -113,7 +132,7 @@ EOF
 
 log() { printf '%s\n' "$*"; }
 
-# Log and execute a command (skipped in dry-run except where noted).
+# Log and execute a command. absorb_one dry-run logs steps directly and never calls this.
 run() {
   if $DRY_RUN; then
     log "[dry-run] $*"
@@ -264,19 +283,11 @@ remove_submodule_registration() {
   run rm -rf ".git/modules/${path}"
 
   if [[ -f .gitmodules ]]; then
-    # FIX: route through run() so dry-run captures these steps too.
     run git config -f .gitmodules --remove-section "submodule.${name}"
 
-    # FIX: count remaining submodule keys rather than relying on --list exit
-    # code, which also fails on whitespace-only or comment-only files and would
-    # silently delete a partially-valid .gitmodules.
-    #
-    # The original `|| echo 0` fallback was dead code: in bash, || after a
-    # pipeline binds to the last command (wc -l), not the whole pipeline, and
-    # wc -l returns 0 on empty input without ever failing. Removing it avoids
-    # false confidence that the fallback was doing anything useful.
+    # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     local remaining
-    remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l)"
+    remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$remaining" -eq 0 ]]; then
       run git rm -f .gitmodules
     else
@@ -284,7 +295,7 @@ remove_submodule_registration() {
     fi
   fi
 
-  # FIX: route through run() so dry-run captures this step too.
+  # Ignore missing section: deinit may have removed it already.
   run git config --remove-section "submodule.${name}" 2>/dev/null || true
 }
 
@@ -314,8 +325,12 @@ absorb_one() {
     else
       log "[dry-run] Would fetch pinned gitlink: ${pinned_sha}"
     fi
-    log "[dry-run] Would verify import ref, remove submodule registration,"
-    log "[dry-run] subtree-merge history, and commit imported tree at ${path}/"
+    log "[dry-run] Would verify import ref"
+    log "[dry-run] Would run: git submodule deinit -f ${path}"
+    log "[dry-run] Would run: git rm -f ${path}"
+    log "[dry-run] Would remove: .git/modules/${path}"
+    log "[dry-run] Would update .gitmodules and git config"
+    log "[dry-run] Would subtree-merge and commit imported tree at ${path}/"
     return 0
   fi
 
@@ -323,7 +338,7 @@ absorb_one() {
   # This can happen if a previous run was interrupted and cleanup_on_exit did
   # not fire (e.g. SIGKILL). The remote will be replaced, but surfacing the
   # warning makes leftover state visible rather than silently overwriting it.
-  if git remote get-url "$remote_name" >/dev/null 2>&1; then
+  if git config --get "remote.${remote_name}.url" >/dev/null 2>&1; then
     log "Warning: temporary remote '${remote_name}' already exists; replacing it." >&2
   fi
 
@@ -334,10 +349,7 @@ absorb_one() {
   import_ref="$(resolve_import_ref "$remote_name" "$path")"
   log "    import ref:        ${import_ref}"
 
-  # FIX: verify the import ref *before* any destructive steps. If the ref is
-  # bad at this point (bad fetch, server restriction, etc.) the submodule
-  # registration would already have been removed, leaving the tree in a
-  # half-absorbed state with no easy recovery.
+  # Verify before removing submodule metadata so a bad fetch never half-absorbs.
   verify_import_ref "$import_ref"
 
   remove_submodule_registration "$name" "$path"
@@ -349,9 +361,7 @@ absorb_one() {
     exit 1
   fi
 
-  # FIX: surface a clear recovery hint if read-tree fails. At this point the
-  # merge has been staged; aborting the merge and hard-resetting to HEAD
-  # restores the index and working tree to the pre-absorb state.
+  # If read-tree fails, merge --abort && reset --hard restores pre-absorb state.
   log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
   git read-tree --prefix="${path}/" -u "$import_ref" || {
     log "Error: read-tree failed." >&2
@@ -359,9 +369,6 @@ absorb_one() {
     exit 1
   }
 
-  # FIX: only emit the pinned-SHA line when it is actually set (i.e. not using
-  # --branch mode), so the commit message does not contain a trailing blank line
-  # when IMPORT_BRANCH is set and pinned_line is empty.
   local pinned_line=""
   if [[ -z "$IMPORT_BRANCH" && -n "$pinned_sha" ]]; then
     pinned_line="Original pinned gitlink SHA: ${pinned_sha}"
@@ -461,9 +468,8 @@ main() {
     names+=("$name")
   done < <(submodule_names)
 
-  # FIX: warn explicitly when .gitmodules exists but yielded no submodule
-  # paths, which most likely indicates a malformed or partially-edited file.
   if [[ -f .gitmodules && ${#names[@]} -eq 0 ]]; then
+    # .gitmodules present but no paths parsed — likely malformed or empty.
     log "Warning: .gitmodules exists but no submodule paths were found. Malformed?" >&2
   fi
 
@@ -502,15 +508,7 @@ main() {
   # produce the submodule *name* instead of its *path*, corrupting the final
   # `git log` hints.
   #
-  # Implemented as parallel indexed arrays (names[i] -> paths[i]) rather than
-  # an associative array because associative arrays require Bash 4+, and macOS
-  # ships /bin/bash at 3.2. Parallel arrays are the standard Bash 3.2-safe
-  # substitute and are sufficient here since nothing needs name-keyed lookup
-  # after the absorption loop. If this script is ever restricted to Bash 4+
-  # environments, replace with:
-  #   declare -A SUBMODULE_PATHS
-  #   SUBMODULE_PATHS["$name"]="$(submodule_path "$name")"
-  #   paths+=("${SUBMODULE_PATHS[$name]}")
+  # Parallel array (Bash 3.2-safe); associative arrays require Bash 4+.
   local paths=()
   for name in "${names[@]}"; do
     paths+=("$(submodule_path "$name")")
