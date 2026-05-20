@@ -191,7 +191,7 @@ require_clean_submodules() {
       git -C "$sub" status --short >&2
       dirty=true
     fi
-  done < <(git submodule --quiet foreach --recursive 'echo "$displaypath"' 2>/dev/null || true)
+  done < <(git submodule --quiet foreach --recursive "echo \"\$displaypath\"" 2>/dev/null || true)
 
   if $dirty; then
     log "" >&2
@@ -479,7 +479,7 @@ EOF
 # whether one or several submodules were absorbed before a failure.
 do_reset() {
   local upstream
-  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)"
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
 
   if [[ -z "$upstream" ]]; then
     log "Error: no upstream configured for $(current_branch)." >&2
