@@ -398,38 +398,11 @@ absorb_one() {
 
   remove_submodule_registration "$name" "$path"
 
-  # Commit the submodule removal before merging. remove_submodule_registration
-  # stages changes (git rm, .gitmodules edit) but does not commit them. git merge
-  # refuses to start with staged changes in the index, so we must commit first.
-  # The merge and read-tree below then build on top of this commit, and the final
-  # git commit --amend rewrites it to include the imported tree with the full
-  # descriptive message — so only one commit per submodule appears in the log.
   local pinned_line=""
   if [[ -z "$IMPORT_BRANCH" && -n "$pinned_sha" ]]; then
     pinned_line="Original pinned gitlink SHA: ${pinned_sha}"
   fi
 
-  git commit -m "chore: remove submodule ${name} (absorb in progress)"
-
-  if ! git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"; then
-    # cleanup_on_exit handles the remote; advise on the merge state only.
-    log "Error: merge failed." >&2
-    log "       Run: git merge --abort && git reset --hard HEAD~1" >&2
-    exit 1
-  fi
-
-  # If read-tree fails, abort the merge and reset past the interim removal commit.
-  log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
-  git read-tree --prefix="${path}/" -u "$import_ref" || {
-    log "Error: read-tree failed." >&2
-    log "       Run: git merge --abort && git reset --hard HEAD~1" >&2
-    exit 1
-  }
-
-  # Finalize the merge first (closes the merge state), then immediately amend
-  # to squash the interim removal commit and the merge+tree import into a single
-  # commit with the full descriptive message. git commit --amend cannot run while
-  # a merge is in progress, so the two-step sequence is required.
   local commit_msg
   commit_msg="$(cat <<EOF
 Absorb submodule ${name} into monorepo
@@ -440,7 +413,29 @@ ${pinned_line:+"${pinned_line}"}
 Removes submodule link; directory is now part of this repository.
 EOF
 )"
-  git commit -m "$commit_msg"
+
+  # Merge the submodule history using the "ours" strategy so git records the
+  # merge parent (preserving history linkage) but keeps our working tree.
+  # We allow the merge to commit immediately — this clears the merge state so
+  # that read-tree and the subsequent amend can run cleanly.
+  # Note: the staged removal changes from remove_submodule_registration are
+  # included in this merge commit automatically since we do not use --no-commit.
+  if ! git merge -s ours --allow-unrelated-histories -m "$commit_msg" "$import_ref"; then
+    log "Error: merge failed." >&2
+    log "       Run: git reset --hard HEAD" >&2
+    exit 1
+  fi
+
+  # Graft the actual submodule file tree onto the merge commit. read-tree
+  # stages the files; amend folds them into the merge commit so the final
+  # result is a single commit per submodule with both the history link and
+  # the imported files.
+  log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
+  git read-tree --prefix="${path}/" -u "$import_ref" || {
+    log "Error: read-tree failed." >&2
+    log "       Run: git reset --hard HEAD" >&2
+    exit 1
+  }
   git commit --amend -m "$commit_msg"
 
   remove_import_remote "$remote_name"
