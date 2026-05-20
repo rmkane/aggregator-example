@@ -398,27 +398,37 @@ absorb_one() {
 
   remove_submodule_registration "$name" "$path"
 
-  if ! git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"; then
-    # cleanup_on_exit handles the remote; advise on the merge state only.
-    log "Error: merge failed." >&2
-    log "       Run: git merge --abort" >&2
-    exit 1
-  fi
-
-  # If read-tree fails, merge --abort && reset --hard restores pre-absorb state.
-  log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
-  git read-tree --prefix="${path}/" -u "$import_ref" || {
-    log "Error: read-tree failed." >&2
-    log "       Run: git merge --abort && git reset --hard HEAD" >&2
-    exit 1
-  }
-
+  # Commit the submodule removal before merging. remove_submodule_registration
+  # stages changes (git rm, .gitmodules edit) but does not commit them. git merge
+  # refuses to start with staged changes in the index, so we must commit first.
+  # The merge and read-tree below then build on top of this commit, and the final
+  # git commit --amend rewrites it to include the imported tree with the full
+  # descriptive message — so only one commit per submodule appears in the log.
   local pinned_line=""
   if [[ -z "$IMPORT_BRANCH" && -n "$pinned_sha" ]]; then
     pinned_line="Original pinned gitlink SHA: ${pinned_sha}"
   fi
 
-  git commit -m "$(cat <<EOF
+  git commit -m "chore: remove submodule ${name} (absorb in progress)"
+
+  if ! git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"; then
+    # cleanup_on_exit handles the remote; advise on the merge state only.
+    log "Error: merge failed." >&2
+    log "       Run: git merge --abort && git reset --hard HEAD~1" >&2
+    exit 1
+  fi
+
+  # If read-tree fails, abort the merge and reset past the interim removal commit.
+  log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
+  git read-tree --prefix="${path}/" -u "$import_ref" || {
+    log "Error: read-tree failed." >&2
+    log "       Run: git merge --abort && git reset --hard HEAD~1" >&2
+    exit 1
+  }
+
+  # Amend the interim removal commit to include the imported tree and replace
+  # the placeholder message with the full descriptive one.
+  git commit --amend -m "$(cat <<EOF
 Absorb submodule ${name} into monorepo
 
 Import history from ${url} at ${path}/.
