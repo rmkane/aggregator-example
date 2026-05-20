@@ -46,7 +46,7 @@
 # ShellCheck
 #   It is recommended to run ShellCheck against this script in CI or as a
 #   pre-commit hook to catch shell-specific issues early:
-#     "shellcheck absorb-submodules.sh"
+#     `shellcheck absorb-submodules.sh`
 #   See https://www.shellcheck.net for installation instructions.
 # =============================================================================
 set -euo pipefail
@@ -469,13 +469,20 @@ main() {
     sleep 5
   fi
 
-  # Absorb each submodule and collect its resolved path for the final summary.
-  # The paths array is built here rather than upfront so it stays in sync with
-  # the names that were actually processed.
+  # Cache submodule paths before any absorption begins. absorb_one removes each
+  # submodule's entry from .gitmodules and may delete the file entirely once the
+  # last submodule is absorbed. Reading paths post-absorption would silently
+  # fall back to the submodule *name* instead of its *path*, producing wrong
+  # `git log` hints in the final summary.
+  declare -A SUBMODULE_PATHS
+  for name in "${names[@]}"; do
+    SUBMODULE_PATHS["$name"]="$(submodule_path "$name")"
+  done
+
   local paths=()
   for name in "${names[@]}"; do
     absorb_one "$name"
-    paths+=("$(git config -f .gitmodules --get "submodule.${name}.path" 2>/dev/null || echo "$name")")
+    paths+=("${SUBMODULE_PATHS[$name]}")
   done
 
   log ""
