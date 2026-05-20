@@ -1,12 +1,34 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Filename: scripts/absorb-submodules.sh
-# Description: Absorb submodules into the aggregator project
-# Usage: ./scripts/absorb-submodules.sh
-# Example: ./scripts/absorb-submodules.sh absorb -b develop
-# Example: ./scripts/absorb-submodules.sh absorb -n
-# Example: ./scripts/absorb-submodules.sh absorb -h
-# ==============================================================================
+# =============================================================================
+# absorb-submodules.sh
+#
+# Converts git submodules into normal directories in this repository while
+# preserving their commit history under the same paths (subtree merge).
+#
+# Usage
+#   ./scripts/absorb-submodules.sh absorb [options]
+#   ./scripts/absorb-submodules.sh --help
+#
+# Examples
+#   ./scripts/absorb-submodules.sh absorb --dry-run
+#   ./scripts/absorb-submodules.sh absorb
+#   ./scripts/absorb-submodules.sh absorb -b develop
+#
+# Requirements
+#   - Run from the repository root, or any path inside it
+#   - Clean working tree with no uncommitted changes
+#   - Network access to submodule remotes (unless already fetched)
+#
+# After running
+#   - .gitmodules is removed when no submodules remain
+#   - .git/modules/<path> is deleted for each absorbed submodule
+#   - Former submodule paths contain normal tracked files
+#   - git log -- <path>/ shows imported history (e.g. demo-submodule-a/)
+#
+# Recommended before running
+#   git checkout -b absorb-submodules-backup   # optional safety branch
+#   git push origin develop                    # ensure remotes are current
+# =============================================================================
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -14,22 +36,30 @@ cd "$ROOT"
 
 COMMAND=""
 DRY_RUN=false
+# When set, import the branch tip from the submodule remote instead of the
+# commit pinned in the current HEAD tree (gitlink).
 IMPORT_BRANCH=""
 
 usage() {
   cat <<EOF
 Usage:
   $0 absorb [options]
-  $0 -h | --help
+  $0 --help
 
 Commands:
-  absorb              Absorb configured git submodules
+  absorb              Absorb all submodules listed in .gitmodules
 
 Options:
-  -n, --dry-run       Print actions without changing anything
-  -b, --branch NAME   Import submodule history from this branch
-                      Default: import the pinned submodule commit from HEAD
+  -n, --dry-run       Print planned git commands without executing them
+  -b, --branch NAME   Import history leading to this branch tip
+                      (default: the submodule commit pinned at HEAD)
   -h, --help          Show this help
+
+Notes:
+  - Default import uses the gitlink SHA recorded in HEAD, not the branch
+    named in .gitmodules. That matches what the aggregator actually pins.
+  - Creates one commit per submodule. Requires a clean working tree.
+  - Run from a backup branch before pushing to a shared remote.
 
 Examples:
   $0 absorb --dry-run
@@ -40,6 +70,7 @@ EOF
 
 log() { printf '%s\n' "$*"; }
 
+# Log and optionally execute a command (used for consistent dry-run output).
 run() {
   if $DRY_RUN; then
     log "[dry-run] $*"
@@ -51,16 +82,31 @@ run() {
 
 require_clean_tree() {
   [[ -z "$(git status --porcelain)" ]] && return 0
-
   log "Error: working tree is not clean. Commit or stash first." >&2
   exit 1
 }
 
 submodule_names() {
   [[ -f .gitmodules ]] || return 0
-
+  # List submodule section names (e.g. demo-submodule-a) from .gitmodules paths.
   git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
-    | sed -E 's/^submodule\.(.*)\.path .*/\1/' || true
+    | sed -E 's/^submodule\.([^.]+)\.path .*/\1/' || true
+}
+
+remove_import_remote() {
+  local remote_name="$1"
+  # Idempotent: remote may not exist on the first submodule or after a failed run.
+  git remote remove "$remote_name" 2>/dev/null || true
+}
+
+verify_import_ref() {
+  local ref="$1"
+  # Ensure the ref resolves to a commit before we touch the index or merge.
+  if ! git rev-parse --verify "${ref}^{commit}" >/dev/null 2>&1; then
+    log "Error: import ref does not resolve to a commit: ${ref}" >&2
+    log "       Fetch may have failed or the branch/commit does not exist on the remote." >&2
+    exit 1
+  fi
 }
 
 resolve_import_ref() {
@@ -68,23 +114,50 @@ resolve_import_ref() {
   local path="$2"
 
   if [[ -n "$IMPORT_BRANCH" ]]; then
-    git fetch "$remote_name" "$IMPORT_BRANCH"
+    # Explicit branch: import the remote branch tip (may differ from pinned gitlink).
+    run git fetch "$remote_name" "$IMPORT_BRANCH"
     printf '%s\n' "${remote_name}/${IMPORT_BRANCH}"
     return 0
   fi
 
+  # Default: import exactly what this repo pins for the submodule at HEAD.
   local commit
   commit="$(git ls-tree HEAD "$path" | awk '{print $3}')"
 
   if [[ -z "$commit" ]]; then
-    log "Error: could not resolve gitlink commit for ${path}" >&2
+    log "Error: no gitlink for ${path} at HEAD — is it registered as a submodule?" >&2
     exit 1
   fi
 
-  git fetch "$remote_name" --tags
-  git fetch "$remote_name" "$commit" 2>/dev/null || true
+  # Fetch the commit and its ancestors from the remote so 'git log -- path/' has history.
+  run git fetch "$remote_name" "$commit"
 
   printf '%s\n' "$commit"
+}
+
+remove_submodule_registration() {
+  local name="$1"
+  local path="$2"
+
+  # Drop submodule checkout metadata before we replace the gitlink with real files.
+  run git submodule deinit -f "$path"
+  run git rm -f "$path"
+  run rm -rf ".git/modules/${path}"
+
+  # Remove from .gitmodules; delete the file when no sections remain.
+  if [[ -f .gitmodules ]]; then
+    git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
+    if [[ -f .gitmodules ]] && ! git config -f .gitmodules --list >/dev/null 2>&1; then
+      git rm -f .gitmodules
+    else
+      git add .gitmodules
+    fi
+  fi
+
+  # deinit does not always remove the local submodule.* config block.
+  if ! $DRY_RUN; then
+    git config --remove-section "submodule.${name}" 2>/dev/null || true
+  fi
 }
 
 absorb_one() {
@@ -98,38 +171,35 @@ absorb_one() {
 
   log ""
   log "=== Absorbing submodule '${name}' ==="
-  log "    path:             ${path}"
-  log "    remote:           ${url}"
-  log "    configured branch:${branch:-<none>}"
-  log "    import branch:    ${IMPORT_BRANCH:-<pinned gitlink commit>}"
+  log "    path:              ${path}"
+  log "    remote:            ${url}"
+  log "    .gitmodules branch:${branch:-<none>} (informational unless -b is used)"
+  log "    import mode:       ${IMPORT_BRANCH:+branch ${IMPORT_BRANCH}}${IMPORT_BRANCH:-pinned gitlink at HEAD}"
 
+  # Temporary remote — avoids mutating existing remotes; removed after each absorb.
   if $DRY_RUN; then
-    log "[dry-run] Would fetch history, remove submodule metadata, and import files into ${path}/"
+    log "[dry-run] git remote remove/add ${remote_name} -> ${url}"
+    run git fetch "$remote_name" "${IMPORT_BRANCH:-<pinned-commit>}"
+    log "[dry-run] Would verify import ref, remove submodule registration,"
+    log "[dry-run] subtree-merge history, and commit imported tree at ${path}/"
     return 0
   fi
 
-  git remote remove "$remote_name" 2>/dev/null || true
+  remove_import_remote "$remote_name"
   git remote add "$remote_name" "$url"
 
   import_ref="$(resolve_import_ref "$remote_name" "$path")"
+  log "    import ref:        ${import_ref}"
+  verify_import_ref "$import_ref"
 
-  log "    import ref:       ${import_ref}"
+  # Remove gitlink and submodule machinery first so merge/read-tree operate on a clean index.
+  remove_submodule_registration "$name" "$path"
 
-  git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"
+  # Subtree merge: record a merge commit without taking their tree yet (strategy ours).
+  run git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"
 
-  git submodule deinit -f "$path" 2>/dev/null || true
-  git rm -f "$path"
-  rm -rf ".git/modules/${path}"
-
-  git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
-
-  git read-tree --prefix="${path}/" -u "$import_ref"
-
-  if [[ -f .gitmodules ]] && ! git config -f .gitmodules --list >/dev/null 2>&1; then
-    git rm -f .gitmodules
-  elif [[ -f .gitmodules ]]; then
-    git add .gitmodules
-  fi
+  # Overlay their tree at the submodule path; prefixes paths in historical commits.
+  run git read-tree --prefix="${path}/" -u "$import_ref"
 
   git commit -m "$(cat <<EOF
 Absorb submodule ${name} into monorepo
@@ -141,10 +211,8 @@ Removes submodule link; directory is now part of this repository.
 EOF
 )"
 
-  git remote remove "$remote_name"
-  git config --remove-section "submodule.${name}" 2>/dev/null || true
-
-  log "Done: ${path}/"
+  remove_import_remote "$remote_name"
+  log "Done: ${path}/  (history: git log -- ${path}/)"
 }
 
 parse_args() {
@@ -159,19 +227,19 @@ parse_args() {
         COMMAND="absorb"
         shift
         ;;
-      -n|--dry-run)
+      -n | --dry-run)
         DRY_RUN=true
         shift
         ;;
-      -b|--branch)
+      -b | --branch)
         IMPORT_BRANCH="${2:-}"
-        [[ -z "$IMPORT_BRANCH" ]] && {
+        [[ -n "$IMPORT_BRANCH" ]] || {
           log "Error: --branch requires a value" >&2
           exit 1
         }
         shift 2
         ;;
-      -h|--help)
+      -h | --help)
         usage
         exit 0
         ;;
@@ -189,6 +257,8 @@ main() {
   parse_args "$@"
 
   [[ "$COMMAND" == "absorb" ]] || {
+    log "Error: missing required command 'absorb'" >&2
+    echo
     usage
     exit 1
   }
@@ -223,7 +293,8 @@ main() {
   log "All done."
   log "Verify with:"
   log "  git submodule status"
-  log "  git log --all -- path/to/module"
+  log "  git log -- demo-submodule-a/"
+  log "  git log -- demo-submodule-b/"
 }
 
 main "$@"
