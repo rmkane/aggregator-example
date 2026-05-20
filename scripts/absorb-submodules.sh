@@ -31,6 +31,7 @@
 #   - History: git log --all -- <path>/  (see "Verifying history" below)
 #
 # Recommended before running
+#   git submodule update --init --recursive    # ensure submodules are initialized
 #   git checkout -b absorb-submodules-backup   # optional safety branch
 #   git push origin develop                    # ensure remotes are current
 #
