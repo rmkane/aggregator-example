@@ -323,6 +323,7 @@ remove_submodule_registration() {
   run_cmd git submodule deinit -f "$path"
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
+  printf "DEBUG line %s: past rm -rf\n" "${LINENO}" >&2
 
   # Remove submodule sections from .gitmodules and .git/config.
   # deinit often removes these sections first so "missing section" is normal.
