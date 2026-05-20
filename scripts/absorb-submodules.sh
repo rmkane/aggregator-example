@@ -414,29 +414,34 @@ Removes submodule link; directory is now part of this repository.
 EOF
 )"
 
-  # Merge the submodule history using the "ours" strategy so git records the
-  # merge parent (preserving history linkage) but keeps our working tree.
-  # We allow the merge to commit immediately — this clears the merge state so
-  # that read-tree and the subsequent amend can run cleanly.
-  # Note: the staged removal changes from remove_submodule_registration are
-  # included in this merge commit automatically since we do not use --no-commit.
-  if ! git merge -s ours --allow-unrelated-histories -m "$commit_msg" "$import_ref"; then
+  # git merge refuses to start with staged changes in the index. The removal
+  # steps above (git rm, .gitmodules edit) leave staged content, so we must
+  # commit them first. We then merge, read-tree, and use reset --soft HEAD~2
+  # to squash the interim removal commit and the merge commit into a single
+  # final commit — so only one commit per submodule appears in the log.
+  git commit -m "chore: remove submodule ${name} (absorb in progress)"
+
+  if ! git merge -s ours --allow-unrelated-histories "$import_ref"; then
     log "Error: merge failed." >&2
-    log "       Run: git reset --hard HEAD" >&2
+    log "       Run: git reset --hard HEAD~1" >&2
     exit 1
   fi
 
-  # Graft the actual submodule file tree onto the merge commit. read-tree
-  # stages the files; amend folds them into the merge commit so the final
-  # result is a single commit per submodule with both the history link and
-  # the imported files.
+  # Graft the actual submodule file tree onto HEAD. read-tree stages the
+  # files under the submodule path prefix.
   log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
   git read-tree --prefix="${path}/" -u "$import_ref" || {
     log "Error: read-tree failed." >&2
-    log "       Run: git reset --hard HEAD" >&2
+    log "       Run: git reset --hard HEAD~1" >&2
     exit 1
   }
-  git commit --amend -m "$commit_msg"
+
+  # Squash the interim removal commit and the merge commit into one.
+  # reset --soft HEAD~2 moves the branch pointer back two commits while
+  # leaving the index intact, so the final commit contains everything:
+  # the removal, the merge parent link, and the imported file tree.
+  git reset --soft HEAD~2
+  git commit -m "$commit_msg"
 
   remove_import_remote "$remote_name"
   ACTIVE_IMPORT_REMOTE=""
