@@ -358,7 +358,13 @@ remove_submodule_registration() {
     local remaining
     remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$remaining" -eq 0 ]]; then
-      run_cmd git rm -f .gitmodules
+      # Use git rm if tracked, plain rm if not (e.g. left empty by a prior deinit).
+      # git rm -f on an untracked file exits non-zero and kills the script.
+      if git ls-files --error-unmatch .gitmodules >/dev/null 2>&1; then
+        run_cmd git rm -f .gitmodules
+      else
+        run_cmd rm -f .gitmodules
+      fi
     else
       run_cmd git add .gitmodules
     fi
