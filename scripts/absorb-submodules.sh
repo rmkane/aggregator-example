@@ -325,7 +325,8 @@ remove_submodule_registration() {
   run rm -rf ".git/modules/${path}"
 
   if [[ -f .gitmodules ]]; then
-    run git config -f .gitmodules --remove-section "submodule.${name}"
+    # deinit may have already removed this section; ignore missing section error.
+    run git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
 
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     local remaining
