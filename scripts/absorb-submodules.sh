@@ -6,15 +6,15 @@
 # preserving their commit history under the same paths (subtree merge).
 #
 # Usage
-#   ./scripts/absorb-submodules.sh absorb [options]
+#   ./scripts/absorb-submodules.sh run [options]
 #   ./scripts/absorb-submodules.sh --help
 #
 # Examples
-#   ./scripts/absorb-submodules.sh absorb --dry-run
-#   ./scripts/absorb-submodules.sh absorb
-#   ./scripts/absorb-submodules.sh absorb --yes
-#   ./scripts/absorb-submodules.sh absorb -b develop
-#   ./scripts/absorb-submodules.sh absorb --submodule my-lib
+#   ./scripts/absorb-submodules.sh run --dry-run
+#   ./scripts/absorb-submodules.sh run
+#   ./scripts/absorb-submodules.sh run --yes
+#   ./scripts/absorb-submodules.sh run -b develop
+#   ./scripts/absorb-submodules.sh run --submodule my-lib
 #
 # Requirements
 #   - Bash 3.2 or newer (macOS /bin/bash 3.2 and Bash 4.x are both supported)
@@ -51,7 +51,7 @@
 #     success and on normal exit (trap). SIGKILL may leave one behind — see below.
 #   - Refuses to absorb a path that is not a gitlink at HEAD (already absorbed).
 #   - Some remotes block direct SHA fetch; the script retries with a full fetch.
-#     If verification still fails, try absorb -b <branch>.
+#     If verification still fails, try run -b <branch>.
 #
 # Limitations
 #   - Submodule paths containing spaces are not supported.
@@ -98,10 +98,10 @@ ACTIVE_IMPORT_REMOTE=""
 
 usage_short() {
   cat <<EOF
-Usage: $0 absorb [options]
+Usage: $0 run [options]
 
 Try:
-  $0 absorb --dry-run
+  $0 run --dry-run
   $0 -h | --help        full help
 EOF
 }
@@ -109,11 +109,11 @@ EOF
 usage() {
   cat <<EOF
 Usage:
-  $0 absorb [options]
+  $0 run [options]
   $0 -h | --help
 
 Commands:
-  absorb              Absorb all submodules listed in .gitmodules
+  run                 Absorb all submodules listed in .gitmodules
 
 Options:
   -n, --dry-run           Print planned steps without executing git commands
@@ -134,10 +134,10 @@ Notes:
   - See script header for full behavior, limitations, and ShellCheck usage.
 
 Examples:
-  $0 absorb --dry-run
-  $0 absorb --yes
-  $0 absorb -b develop
-  $0 absorb --submodule my-lib
+  $0 run --dry-run
+  $0 run --yes
+  $0 run -b develop
+  $0 run --submodule my-lib
 EOF
 }
 
@@ -249,7 +249,7 @@ verify_import_ref() {
   if ! git rev-parse --verify "${ref}^{commit}" >/dev/null 2>&1; then
     log "Error: import ref does not resolve to a commit: ${ref}" >&2
     log "       Fetch may have failed or the server may block direct SHA fetch." >&2
-    log "       Try: $0 absorb -b <branch>   or ensure the pinned commit exists on the remote." >&2
+    log "       Try: $0 run -b <branch>   or ensure the pinned commit exists on the remote." >&2
     exit 1
   fi
 
@@ -327,7 +327,15 @@ remove_submodule_registration() {
 
   if [[ -f .gitmodules ]]; then
     # deinit may have already removed this section; ignore missing section error.
-    run git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
+    # Run directly rather than via run() so that || true is applied to the git
+    # command itself. When passed through run(), || true applies to the run()
+    # call and set -e can still kill the script on a non-zero exit from git.
+    # deinit may have already removed this section, so missing section is expected.
+    if $DRY_RUN; then
+      log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
+    else
+      git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
+    fi
 
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     local remaining
@@ -340,7 +348,8 @@ remove_submodule_registration() {
   fi
 
   # Ignore missing section: deinit may have removed it already.
-  run git config --remove-section "submodule.${name}" 2>/dev/null || true
+  # Run directly (not via run()) so || true applies to git itself, not the wrapper.
+  git config --remove-section "submodule.${name}" 2>/dev/null || true
 }
 
 absorb_one() {
@@ -421,7 +430,7 @@ EOF
   # final commit — so only one commit per submodule appears in the log.
   git commit -m "chore: remove submodule ${name} (absorb in progress)"
 
-  if ! git merge -s ours --allow-unrelated-histories "$import_ref"; then
+  if ! git merge -s ours --allow-unrelated-histories -m "chore: merge ${name} history (absorb in progress)" "$import_ref"; then
     log "Error: merge failed." >&2
     log "       Run: git reset --hard HEAD~1" >&2
     exit 1
@@ -456,8 +465,8 @@ parse_args() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      absorb)
-        COMMAND="absorb"
+      run)
+        COMMAND="run"
         shift
         ;;
       -n | --dry-run)
@@ -504,8 +513,8 @@ parse_args() {
 main() {
   parse_args "$@"
 
-  [[ "$COMMAND" == "absorb" ]] || {
-    log "Error: missing required command 'absorb'" >&2
+  [[ "$COMMAND" == "run" ]] || {
+    log "Error: missing required command 'run'" >&2
     usage_short >&2
     exit 1
   }
