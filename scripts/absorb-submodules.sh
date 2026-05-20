@@ -95,11 +95,21 @@ IMPORT_BRANCH=""
 # Set while a temporary import remote is registered; cleared after each absorb.
 ACTIVE_IMPORT_REMOTE=""
 
+usage_short() {
+  cat <<EOF
+Usage: $0 absorb [options]
+
+Try:
+  $0 absorb --dry-run
+  $0 -h | --help        full help
+EOF
+}
+
 usage() {
   cat <<EOF
 Usage:
   $0 absorb [options]
-  $0 --help
+  $0 -h | --help
 
 Commands:
   absorb              Absorb all submodules listed in .gitmodules
@@ -415,6 +425,7 @@ parse_args() {
         IMPORT_BRANCH="${2:-}"
         [[ -n "$IMPORT_BRANCH" ]] || {
           log "Error: --branch requires a value" >&2
+          usage_short >&2
           exit 1
         }
         shift 2
@@ -423,6 +434,7 @@ parse_args() {
         SUBMODULE_FILTER="${2:-}"
         [[ -n "$SUBMODULE_FILTER" ]] || {
           log "Error: --submodule requires a value" >&2
+          usage_short >&2
           exit 1
         }
         shift 2
@@ -432,9 +444,8 @@ parse_args() {
         exit 0
         ;;
       *)
-        log "Unknown argument: $1" >&2
-        echo
-        usage
+        log "Error: unknown argument: $1" >&2
+        usage_short >&2
         exit 1
         ;;
     esac
@@ -446,8 +457,7 @@ main() {
 
   [[ "$COMMAND" == "absorb" ]] || {
     log "Error: missing required command 'absorb'" >&2
-    echo
-    usage
+    usage_short >&2
     exit 1
   }
 
