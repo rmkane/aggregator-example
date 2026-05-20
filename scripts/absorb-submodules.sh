@@ -270,7 +270,10 @@ fetch_pinned_commit() {
   local remote_name="$1"
   local commit="$2"
 
-  log "+ git fetch ${remote_name} (pinned commit ${commit})"
+  # All log calls here go to stderr. This function is called inside a $()
+  # subshell via resolve_import_ref, so anything written to stdout would be
+  # captured as part of the import ref value and corrupt it.
+  log "+ git fetch ${remote_name} (pinned commit ${commit})" >&2
 
   # Use --no-tags to avoid importing submodule tags into the parent repository.
   # Submodule tags (e.g. v1.0, release-2.3) have no meaning in the parent
@@ -283,7 +286,7 @@ fetch_pinned_commit() {
   fi
 
   # Some hosts disallow fetching arbitrary SHAs; a full fetch may still reach the commit.
-  log "  direct SHA fetch failed; trying full remote fetch..."
+  log "  direct SHA fetch failed; trying full remote fetch..." >&2
   git fetch --no-tags "$remote_name" 2>/dev/null || true
 }
 
@@ -294,7 +297,9 @@ resolve_import_ref() {
   if [[ -n "$IMPORT_BRANCH" ]]; then
     # --no-tags: same rationale as fetch_pinned_commit; branch imports should
     # not pull submodule tags into the parent repo namespace.
-    run git fetch --no-tags "$remote_name" "$IMPORT_BRANCH"
+    # Redirect to stderr: resolve_import_ref is called in a $() subshell and
+    # only the final printf should reach stdout as the import ref value.
+    run git fetch --no-tags "$remote_name" "$IMPORT_BRANCH" >&2
     printf '%s\n' "${remote_name}/${IMPORT_BRANCH}"
     return 0
   fi
