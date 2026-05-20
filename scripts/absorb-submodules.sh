@@ -440,10 +440,13 @@ EOF
 
   # git merge refuses to start with staged changes in the index. The removal
   # steps above (git rm, .gitmodules edit) leave staged content, so we must
-  # commit them first. We then merge, read-tree, and use reset --soft HEAD~2
-  # to squash the interim removal commit and the merge commit into a single
-  # final commit — so only one commit per submodule appears in the log.
+  # commit them first.
   git commit -m "chore: remove submodule ${name} (absorb in progress)"
+
+  # Record the pre-merge parent (the removal commit) so we can use it as an
+  # explicit parent when constructing the final commit below.
+  local pre_merge_sha
+  pre_merge_sha="$(git rev-parse HEAD)"
 
   if ! git merge -s ours --allow-unrelated-histories \
       -m "chore: merge ${name} history (absorb in progress)" "$import_ref"; then
@@ -461,12 +464,33 @@ EOF
     exit 1
   }
 
-  # Squash the interim removal commit and the merge commit into one.
-  # reset --soft HEAD~2 moves the branch pointer back two commits while
-  # leaving the index intact, so the final commit contains everything:
-  # the removal, the merge parent link, and the imported file tree.
-  git reset --soft HEAD~2
-  git commit -m "$commit_msg"
+  # Build the final commit using git commit-tree so we can control the parent
+  # list explicitly. We need two parents:
+  #   1. pre_merge_sha  — the removal commit; keeps the linear branch history
+  #      clean by making this look like a direct successor to that commit.
+  #      (reset --soft HEAD~2 below discards it from the branch, so the
+  #      final commit's first parent is actually the commit before removal.)
+  #   2. import_ref     — the submodule tip; this is the merge parent that
+  #      makes git log --all -- <path>/ traverse the full submodule history.
+  #
+  # Using reset --soft HEAD~2 + git commit would produce a single-parent
+  # commit and permanently discard the history link. commit-tree is the only
+  # way to set parents explicitly.
+  local tree_sha final_sha
+  tree_sha="$(git write-tree)"
+
+  # The first parent of the final commit should be the commit that existed
+  # before the interim removal commit — i.e. HEAD~1 relative to pre_merge_sha.
+  local base_sha
+  base_sha="$(git rev-parse "${pre_merge_sha}~1")"
+
+  final_sha="$(git commit-tree "$tree_sha" \
+    -p "$base_sha" \
+    -p "$import_ref" \
+    -m "$commit_msg")"
+
+  # Move the branch pointer to the new commit and clean up the interim commits.
+  git reset --hard "$final_sha"
 
   remove_import_remote "$remote_name"
   ACTIVE_IMPORT_REMOTE=""
