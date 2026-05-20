@@ -12,12 +12,16 @@
 # Examples
 #   ./scripts/absorb-submodules.sh absorb --dry-run
 #   ./scripts/absorb-submodules.sh absorb
+#   ./scripts/absorb-submodules.sh absorb --yes
 #   ./scripts/absorb-submodules.sh absorb -b develop
+#   ./scripts/absorb-submodules.sh absorb --submodule my-lib
 #
 # Requirements
 #   - Run from the repository root, or any path inside it
 #   - Clean working tree with no uncommitted changes
 #   - Network access to submodule remotes (unless already fetched)
+#   - Git >= 2.22 recommended (git branch --show-current; falls back to
+#     git rev-parse --abbrev-ref HEAD on older versions)
 #
 # After running
 #   - .gitmodules is removed when no submodules remain
@@ -38,6 +42,12 @@
 #   - Submodule paths containing spaces are not supported.
 #   - If interrupted, re-run after cleaning any leftover absorb-import-* remote
 #     (git remote list); the script also removes them on exit when possible.
+#
+# ShellCheck
+#   It is recommended to run ShellCheck against this script in CI or as a
+#   pre-commit hook to catch shell-specific issues early:
+#     "shellcheck absorb-submodules.sh"
+#   See https://www.shellcheck.net for installation instructions.
 # =============================================================================
 set -euo pipefail
 
@@ -46,6 +56,9 @@ cd "$ROOT"
 
 COMMAND=""
 DRY_RUN=false
+YES=false
+# When set, absorb only this named submodule instead of all of them.
+SUBMODULE_FILTER=""
 # When set, import the branch tip from the submodule remote instead of the
 # commit pinned in the current HEAD tree (gitlink).
 IMPORT_BRANCH=""
@@ -62,10 +75,12 @@ Commands:
   absorb              Absorb all submodules listed in .gitmodules
 
 Options:
-  -n, --dry-run       Print planned steps without executing git commands
-  -b, --branch NAME   Import history leading to this branch tip
-                      (default: the submodule commit pinned at HEAD)
-  -h, --help          Show this help
+  -n, --dry-run           Print planned steps without executing git commands
+  -y, --yes               Skip the 5-second confirmation prompt (for CI / scripts)
+  -b, --branch NAME       Import history leading to this branch tip
+                          (default: the submodule commit pinned at HEAD)
+      --submodule NAME    Absorb only the named submodule (partial migration)
+  -h, --help              Show this help
 
 Notes:
   - Default import uses the gitlink SHA at HEAD, not the branch in .gitmodules.
@@ -74,8 +89,9 @@ Notes:
 
 Examples:
   $0 absorb --dry-run
-  $0 absorb
+  $0 absorb --yes
   $0 absorb -b develop
+  $0 absorb --submodule my-lib
 EOF
 }
 
@@ -104,6 +120,13 @@ require_clean_tree() {
   [[ -z "$(git status --porcelain)" ]] && return 0
   log "Error: working tree is not clean. Commit or stash first." >&2
   exit 1
+}
+
+# Print the current branch name. git branch --show-current requires Git 2.22;
+# fall back to rev-parse for older versions so the script stays broadly
+# compatible without a hard version gate.
+current_branch() {
+  git branch --show-current 2>/dev/null || git rev-parse --abbrev-ref HEAD
 }
 
 submodule_names() {
@@ -142,10 +165,25 @@ assert_is_gitlink() {
 
 verify_import_ref() {
   local ref="$1"
+
+  # Primary check: confirm the ref resolves to a commit object.
   if ! git rev-parse --verify "${ref}^{commit}" >/dev/null 2>&1; then
     log "Error: import ref does not resolve to a commit: ${ref}" >&2
     log "       Fetch may have failed or the server may block direct SHA fetch." >&2
     log "       Try: $0 absorb -b <branch>   or ensure the pinned commit exists on the remote." >&2
+    exit 1
+  fi
+
+  # Secondary check: use cat-file to confirm the object type is actually
+  # "commit" rather than a tag or blob that happened to dereference. This
+  # catches edge cases where ^{commit} resolution succeeds on an annotated tag
+  # pointing to a non-commit object (unusual but possible in adversarial repos).
+  local obj_type
+  obj_type="$(git cat-file -t "$ref" 2>/dev/null || true)"
+  # Annotated tags are acceptable here; git read-tree will dereference them.
+  # Blobs or trees are not valid import refs.
+  if [[ "$obj_type" != "commit" && "$obj_type" != "tag" ]]; then
+    log "Error: import ref '${ref}' resolves to object type '${obj_type:-unknown}', expected commit or tag." >&2
     exit 1
   fi
 }
@@ -155,15 +193,20 @@ fetch_pinned_commit() {
   local commit="$2"
 
   log "+ git fetch ${remote_name} (pinned commit ${commit})"
-  git fetch "$remote_name" --tags 2>/dev/null || true
 
-  if git fetch "$remote_name" "$commit" 2>/dev/null; then
+  # Use --no-tags to avoid importing submodule tags into the parent repository.
+  # Submodule tags (e.g. v1.0, release-2.3) have no meaning in the parent
+  # context, can collide with existing tags, and clutter `git tag` output.
+  # The original `--tags` fetch was overly broad for this use case.
+  git fetch --no-tags "$remote_name" 2>/dev/null || true
+
+  if git fetch --no-tags "$remote_name" "$commit" 2>/dev/null; then
     return 0
   fi
 
   # Some hosts disallow fetching arbitrary SHAs; a full fetch may still reach the commit.
   log "  direct SHA fetch failed; trying full remote fetch..."
-  git fetch "$remote_name" 2>/dev/null || true
+  git fetch --no-tags "$remote_name" 2>/dev/null || true
 }
 
 resolve_import_ref() {
@@ -171,7 +214,9 @@ resolve_import_ref() {
   local path="$2"
 
   if [[ -n "$IMPORT_BRANCH" ]]; then
-    run git fetch "$remote_name" "$IMPORT_BRANCH"
+    # --no-tags: same rationale as fetch_pinned_commit; branch imports should
+    # not pull submodule tags into the parent repo namespace.
+    run git fetch --no-tags "$remote_name" "$IMPORT_BRANCH"
     printf '%s\n' "${remote_name}/${IMPORT_BRANCH}"
     return 0
   fi
@@ -247,6 +292,14 @@ absorb_one() {
     return 0
   fi
 
+  # Warn if the temporary remote name already exists before trying to remove it.
+  # This can happen if a previous run was interrupted and cleanup_on_exit did
+  # not fire (e.g. SIGKILL). The remote will be replaced, but surfacing the
+  # warning makes leftover state visible rather than silently overwriting it.
+  if git remote get-url "$remote_name" >/dev/null 2>&1; then
+    log "Warning: temporary remote '${remote_name}' already exists; replacing it." >&2
+  fi
+
   remove_import_remote "$remote_name"
   git remote add "$remote_name" "$url"
   ACTIVE_IMPORT_REMOTE="$remote_name"
@@ -264,17 +317,18 @@ absorb_one() {
 
   if ! git merge -s ours --no-commit --allow-unrelated-histories "$import_ref"; then
     # cleanup_on_exit handles the remote; advise on the merge state only.
-    log "Error: merge failed. Run: git merge --abort" >&2
+    log "Error: merge failed." >&2
+    log "       Run: git merge --abort" >&2
     exit 1
   fi
 
   # FIX: surface a clear recovery hint if read-tree fails. At this point the
-  # merge has been staged; aborting the merge and hard-resetting HEAD restores
-  # the index and working tree to the pre-absorb state for this submodule.
+  # merge has been staged; aborting the merge and hard-resetting to HEAD
+  # restores the index and working tree to the pre-absorb state.
   log "+ git read-tree --prefix=${path}/ -u ${import_ref}"
   git read-tree --prefix="${path}/" -u "$import_ref" || {
     log "Error: read-tree failed." >&2
-    log "       Run: git merge --abort" >&2
+    log "       Run: git merge --abort && git reset --hard HEAD" >&2
     exit 1
   }
 
@@ -317,10 +371,24 @@ parse_args() {
         DRY_RUN=true
         shift
         ;;
+      -y | --yes)
+        # Skip the interactive 5-second countdown. Intended for CI pipelines
+        # and scripted invocations where stdin is not a terminal.
+        YES=true
+        shift
+        ;;
       -b | --branch)
         IMPORT_BRANCH="${2:-}"
         [[ -n "$IMPORT_BRANCH" ]] || {
           log "Error: --branch requires a value" >&2
+          exit 1
+        }
+        shift 2
+        ;;
+      --submodule)
+        SUBMODULE_FILTER="${2:-}"
+        [[ -n "$SUBMODULE_FILTER" ]] || {
+          log "Error: --submodule requires a value" >&2
           exit 1
         }
         shift 2
@@ -352,18 +420,19 @@ main() {
   trap cleanup_on_exit EXIT
   require_clean_tree
 
+  # Log the current branch so the operator has clear context in the output,
+  # especially useful when reviewing CI logs or verifying the right branch
+  # was checked out before running.
+  log "Repository: ${ROOT}"
+  log "Branch:     $(current_branch)"
+
   local names=()
-  local name path
+  local name
 
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     names+=("$name")
   done < <(submodule_names)
-
-  [[ ${#names[@]} -gt 0 ]] || {
-    log "No submodules defined in .gitmodules — nothing to do."
-    exit 0
-  }
 
   # FIX: warn explicitly when .gitmodules exists but yielded no submodule
   # paths, which most likely indicates a malformed or partially-edited file.
@@ -371,10 +440,29 @@ main() {
     log "Warning: .gitmodules exists but no submodule paths were found. Malformed?" >&2
   fi
 
-  log "Repository: ${ROOT}"
+  [[ ${#names[@]} -gt 0 ]] || {
+    log "No submodules defined in .gitmodules — nothing to do."
+    exit 0
+  }
+
+  # If --submodule was given, restrict to that single entry and fail clearly
+  # if the name does not exist, rather than silently absorbing everything.
+  if [[ -n "$SUBMODULE_FILTER" ]]; then
+    local matched=false
+    for name in "${names[@]}"; do
+      [[ "$name" == "$SUBMODULE_FILTER" ]] && matched=true && break
+    done
+    if ! $matched; then
+      log "Error: submodule '${SUBMODULE_FILTER}' not found in .gitmodules." >&2
+      log "       Known submodules: ${names[*]}" >&2
+      exit 1
+    fi
+    names=("$SUBMODULE_FILTER")
+  fi
+
   log "Submodules to absorb: ${names[*]}"
 
-  if ! $DRY_RUN; then
+  if ! $DRY_RUN && ! $YES; then
     log ""
     log "This will create one commit per submodule."
     log "Press Ctrl+C within 5 seconds to cancel..."
@@ -393,7 +481,13 @@ main() {
   log ""
   log "All done."
   log "Verify with:"
-  log "  git submodule status    # should report no submodules"
+  # Run git submodule status as a live final check rather than just printing
+  # the command. This immediately surfaces any submodule that was not fully
+  # removed, making post-absorb validation part of the run rather than a
+  # manual follow-up step.
+  log "--- git submodule status ---"
+  git submodule status || true
+  log "---"
   for path in "${paths[@]}"; do
     log "  git log --all -- ${path}/"
   done
