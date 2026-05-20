@@ -144,7 +144,7 @@ EOF
 log() { printf '%s\n' "$*"; }
 
 # Log and execute a command. absorb_one dry-run logs steps directly and never calls this.
-run() {
+run_cmd() {
   if $DRY_RUN; then
     log "[dry-run] $*"
   else
@@ -279,7 +279,6 @@ fetch_pinned_commit() {
   # Use --no-tags to avoid importing submodule tags into the parent repository.
   # Submodule tags (e.g. v1.0, release-2.3) have no meaning in the parent
   # context, can collide with existing tags, and clutter `git tag` output.
-  # The original `--tags` fetch was overly broad for this use case.
   git fetch --no-tags "$remote_name" 2>/dev/null || true
 
   if git fetch --no-tags "$remote_name" "$commit" 2>/dev/null; then
@@ -300,7 +299,7 @@ resolve_import_ref() {
     # not pull submodule tags into the parent repo namespace.
     # Redirect to stderr: resolve_import_ref is called in a $() subshell and
     # only the final printf should reach stdout as the import ref value.
-    run git fetch --no-tags "$remote_name" "$IMPORT_BRANCH" >&2
+    run_cmd git fetch --no-tags "$remote_name" "$IMPORT_BRANCH" >&2
     printf '%s\n' "${remote_name}/${IMPORT_BRANCH}"
     return 0
   fi
@@ -317,39 +316,51 @@ resolve_import_ref() {
   printf '%s\n' "$commit"
 }
 
+# Remove all .gitmodules and .git/config references to the named submodule.
+# Both git config calls are run directly (not via run_cmd) with 2>/dev/null
+# and explicit exit-code handling. This is necessary because set -e fires
+# inside run_cmd before the || true on the call site can catch a non-zero exit
+# from git. deinit often removes these sections first, so missing section is
+# a normal and expected condition, not an error.
+remove_gitconfig_sections() {
+  local name="$1"
+
+  if $DRY_RUN; then
+    log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
+    log "[dry-run] git config --remove-section submodule.${name}"
+    return 0
+  fi
+
+  git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
+  git config --remove-section "submodule.${name}" 2>/dev/null || true
+}
+
 remove_submodule_registration() {
   local name="$1"
   local path="$2"
 
-  run git submodule deinit -f "$path"
-  run git rm -f "$path"
-  run rm -rf ".git/modules/${path}"
+  run_cmd git submodule deinit -f "$path"
+  run_cmd git rm -f "$path"
+  run_cmd rm -rf ".git/modules/${path}"
 
+  # Update .gitmodules: remove this submodule's section, then either delete
+  # the file entirely if no submodules remain or stage the updated version.
   if [[ -f .gitmodules ]]; then
-    # deinit may have already removed this section; ignore missing section error.
-    # Run directly rather than via run() so that || true is applied to the git
-    # command itself. When passed through run(), || true applies to the run()
-    # call and set -e can still kill the script on a non-zero exit from git.
-    # deinit may have already removed this section, so missing section is expected.
-    if $DRY_RUN; then
-      log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
-    else
-      git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
-    fi
+    remove_gitconfig_sections "$name"
 
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
+    # wc -l returns 0 on empty input; tr -d strips BSD/macOS leading whitespace.
     local remaining
     remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$remaining" -eq 0 ]]; then
-      run git rm -f .gitmodules
+      run_cmd git rm -f .gitmodules
     else
-      run git add .gitmodules
+      run_cmd git add .gitmodules
     fi
+  else
+    # .gitmodules already gone (deinit removed it); still clean up .git/config.
+    remove_gitconfig_sections "$name"
   fi
-
-  # Ignore missing section: deinit may have removed it already.
-  # Run directly (not via run()) so || true applies to git itself, not the wrapper.
-  git config --remove-section "submodule.${name}" 2>/dev/null || true
 }
 
 absorb_one() {
@@ -430,7 +441,8 @@ EOF
   # final commit — so only one commit per submodule appears in the log.
   git commit -m "chore: remove submodule ${name} (absorb in progress)"
 
-  if ! git merge -s ours --allow-unrelated-histories -m "chore: merge ${name} history (absorb in progress)" "$import_ref"; then
+  if ! git merge -s ours --allow-unrelated-histories \
+      -m "chore: merge ${name} history (absorb in progress)" "$import_ref"; then
     log "Error: merge failed." >&2
     log "       Run: git reset --hard HEAD~1" >&2
     exit 1
