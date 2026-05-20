@@ -127,7 +127,7 @@ Notes:
   - Default import uses the gitlink SHA at HEAD, not the branch in .gitmodules.
   - Verifies the import ref before removing submodule metadata (safe on fetch failure).
   - Dry-run prints a preview only; no git commands are executed.
-  - One commit per submodule. Requires a clean working tree.
+  - One commit per submodule. Requires a clean working tree (parent and submodules).
   - Cannot re-run on a path already absorbed (not a gitlink at HEAD).
   - Verify history with: git log --all -- <path>/
   - See script header for full behavior, limitations, and ShellCheck usage.
@@ -165,6 +165,33 @@ require_clean_tree() {
   [[ -z "$(git status --porcelain)" ]] && return 0
   log "Error: working tree is not clean. Commit or stash first." >&2
   exit 1
+}
+
+# Check that no initialized submodule has uncommitted changes or staged content.
+# git submodule deinit -f silently discards such changes, so we refuse early
+# rather than lose work. Uninitialized submodules (empty dirs) are skipped since
+# they have nothing to lose.
+require_clean_submodules() {
+  local dirty=false
+  local sub status
+
+  while IFS= read -r sub; do
+    [[ -n "$sub" ]] || continue
+
+    # git -C fails gracefully if the submodule dir is missing or uninitialized.
+    status="$(git -C "$sub" status --porcelain 2>/dev/null || true)"
+    if [[ -n "$status" ]]; then
+      log "Error: submodule '${sub}' has uncommitted changes:" >&2
+      git -C "$sub" status --short >&2
+      dirty=true
+    fi
+  done < <(git submodule --quiet foreach --recursive 'echo "$displaypath"' 2>/dev/null || true)
+
+  if $dirty; then
+    log "" >&2
+    log "Commit or stash changes in the above submodule(s) before absorbing." >&2
+    exit 1
+  fi
 }
 
 # Print the current branch name. git branch --show-current requires Git 2.22;
@@ -463,6 +490,7 @@ main() {
 
   trap cleanup_on_exit EXIT
   require_clean_tree
+  require_clean_submodules
 
   # Log the current branch so the operator has clear context in the output,
   # especially useful when reviewing CI logs or verifying the right branch
