@@ -349,25 +349,32 @@ remove_submodule_registration() {
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
 
+  log "DEBUG: checking .gitmodules existence" >&2
   # Update .gitmodules: remove this submodule's section, then either delete
   # the file entirely if no submodules remain or stage the updated version.
   if [[ -f .gitmodules ]]; then
+    log "DEBUG: .gitmodules exists, calling remove_gitconfig_sections" >&2
     remove_gitconfig_sections "$name"
+    log "DEBUG: remove_gitconfig_sections returned $?" >&2
 
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     # wc -l returns 0 on empty input; tr -d strips BSD/macOS leading whitespace.
     local remaining
     remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
+    log "DEBUG: remaining=$remaining" >&2
     if [[ "$remaining" -eq 0 ]]; then
       run_cmd git rm -f .gitmodules
     else
       run_cmd git add .gitmodules
     fi
   else
+    log "DEBUG: .gitmodules does not exist, calling remove_gitconfig_sections" >&2
     # .gitmodules already gone (deinit removed it); still clean up .git/config.
     remove_gitconfig_sections "$name"
   fi
+  log "DEBUG: remove_submodule_registration done" >&2
 }
+
 
 absorb_one() {
   local name="$1"
