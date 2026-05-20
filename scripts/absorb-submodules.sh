@@ -67,6 +67,8 @@
 #   See https://www.shellcheck.net for installation instructions.
 # =============================================================================
 set -euo pipefail
+# Trap to report the exact line number on unexpected exit — remove after debugging.
+trap 'echo "DIED at line ${LINENO}: exit $?" >&2' ERR
 
 # Bash 3.2+ is required. Avoid Bash 4-only features (e.g. associative arrays) so
 # the script runs on macOS /bin/bash 3.2 as well as modern Linux/bash 5.x.
