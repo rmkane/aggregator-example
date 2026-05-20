@@ -426,9 +426,12 @@ absorb_one() {
     exit 1
   }
 
-  # Amend the interim removal commit to include the imported tree and replace
-  # the placeholder message with the full descriptive one.
-  git commit --amend -m "$(cat <<EOF
+  # Finalize the merge first (closes the merge state), then immediately amend
+  # to squash the interim removal commit and the merge+tree import into a single
+  # commit with the full descriptive message. git commit --amend cannot run while
+  # a merge is in progress, so the two-step sequence is required.
+  local commit_msg
+  commit_msg="$(cat <<EOF
 Absorb submodule ${name} into monorepo
 
 Import history from ${url} at ${path}/.
@@ -437,6 +440,8 @@ ${pinned_line:+"${pinned_line}"}
 Removes submodule link; directory is now part of this repository.
 EOF
 )"
+  git commit -m "$commit_msg"
+  git commit --amend -m "$commit_msg"
 
   remove_import_remote "$remote_name"
   ACTIVE_IMPORT_REMOTE=""
