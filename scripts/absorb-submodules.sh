@@ -98,10 +98,12 @@ ACTIVE_IMPORT_REMOTE=""
 
 usage_short() {
   cat <<EOF
-Usage: $0 run [options]
+Usage: $0 <command> [options]
 
+Commands: run | reset
 Try:
   $0 run --dry-run
+  $0 reset --dry-run
   $0 -h | --help        full help
 EOF
 }
@@ -114,6 +116,7 @@ Usage:
 
 Commands:
   run                 Absorb all submodules listed in .gitmodules
+  reset               Undo a previous run: reset to origin and reinitialize submodules
 
 Options:
   -n, --dry-run           Print planned steps without executing git commands
@@ -138,6 +141,8 @@ Examples:
   $0 run --yes
   $0 run -b develop
   $0 run --submodule my-lib
+  $0 reset --dry-run
+  $0 reset
 EOF
 }
 
@@ -323,15 +328,20 @@ remove_submodule_registration() {
   run_cmd git submodule deinit -f "$path"
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
+
+  # Remove submodule sections from .gitmodules and .git/config.
+  # deinit often removes these sections first so "missing section" is normal.
+  # set +e / set -e used directly here — || true and subshell patterns are
+  # unreliable under Bash 3.2 set -e even in the same function scope.
   if $DRY_RUN; then
-      log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
+    log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
     log "[dry-run] git config --remove-section submodule.${name}"
   else
-      set +e
-      git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
-      git config --remove-section "submodule.${name}" 2>/dev/null
-      set -e
-    fi
+    set +e
+    git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
+    git config --remove-section "submodule.${name}" 2>/dev/null
+    set -e
+  fi
 
   # Update .gitmodules: either delete the file entirely if no submodules
   # remain or stage the updated version.
@@ -356,7 +366,6 @@ remove_submodule_registration() {
     fi
   fi
 }
-
 
 absorb_one() {
   local name="$1"
@@ -464,6 +473,49 @@ EOF
   log "Done: ${path}/  (history: git log --all -- ${path}/)"
 }
 
+# Undo a previous absorb run by resetting the branch back to origin and
+# reinitializing submodules. Detects how many commits the current branch is
+# ahead of its upstream and resets exactly that many, so it is safe to run
+# whether one or several submodules were absorbed before a failure.
+do_reset() {
+  local upstream
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)"
+
+  if [[ -z "$upstream" ]]; then
+    log "Error: no upstream configured for $(current_branch)." >&2
+    log "       Set one with: git branch --set-upstream-to=origin/<branch>" >&2
+    exit 1
+  fi
+
+  local ahead
+  ahead="$(git rev-list --count "${upstream}..HEAD")"
+
+  if [[ "$ahead" -eq 0 ]]; then
+    log "Already at ${upstream} — nothing to reset."
+    exit 0
+  fi
+
+  log "Branch is ${ahead} commit(s) ahead of ${upstream}."
+  log "Will reset: git reset --hard HEAD~${ahead}"
+  log "Then:       git submodule update --init --recursive"
+
+  if $DRY_RUN; then
+    log "[dry-run] git reset --hard HEAD~${ahead}"
+    log "[dry-run] git submodule update --init --recursive"
+    return 0
+  fi
+
+  if ! $YES; then
+    log ""
+    log "This will discard ${ahead} local commit(s). Press Ctrl+C within 5 seconds to cancel..."
+    sleep 5
+  fi
+
+  git reset --hard "HEAD~${ahead}"
+  git submodule update --init --recursive
+  log "Reset complete. Branch is now at $(git rev-parse --short HEAD)."
+}
+
 parse_args() {
   [[ $# -eq 0 ]] && {
     usage_short
@@ -474,6 +526,10 @@ parse_args() {
     case "$1" in
       run)
         COMMAND="run"
+        shift
+        ;;
+      reset)
+        COMMAND="reset"
         shift
         ;;
       -n | --dry-run)
@@ -520,8 +576,13 @@ parse_args() {
 main() {
   parse_args "$@"
 
+  if [[ "$COMMAND" == "reset" ]]; then
+    do_reset
+    exit 0
+  fi
+
   [[ "$COMMAND" == "run" ]] || {
-    log "Error: missing required command 'run'" >&2
+    log "Error: missing required command. Use 'run' or 'reset'." >&2
     usage_short >&2
     exit 1
   }
