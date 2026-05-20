@@ -248,8 +248,13 @@ remove_submodule_registration() {
     # FIX: count remaining submodule keys rather than relying on --list exit
     # code, which also fails on whitespace-only or comment-only files and would
     # silently delete a partially-valid .gitmodules.
+    #
+    # The original `|| echo 0` fallback was dead code: in bash, || after a
+    # pipeline binds to the last command (wc -l), not the whole pipeline, and
+    # wc -l returns 0 on empty input without ever failing. Removing it avoids
+    # false confidence that the fallback was doing anything useful.
     local remaining
-    remaining=$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l || echo 0)
+    remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l)"
     if [[ "$remaining" -eq 0 ]]; then
       run git rm -f .gitmodules
     else
