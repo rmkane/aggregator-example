@@ -323,23 +323,15 @@ remove_submodule_registration() {
   run_cmd git submodule deinit -f "$path"
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
-  printf "DEBUG A: past rm -rf\n" "${LINENO}" >&2
   if $DRY_RUN; then
-    printf "DEBUG B: dry-run branch\n" >&2
-    log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
+      log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
     log "[dry-run] git config --remove-section submodule.${name}"
   else
-    printf "DEBUG C: about to set +e\n" >&2
-    set +e
-    printf "DEBUG D: about to git config .gitmodules\n" >&2
-    git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
-    printf "DEBUG E: about to git config .git/config, exit=%s\n" "$?" >&2
-    git config --remove-section "submodule.${name}" 2>/dev/null
-    printf "DEBUG F: about to set -e, exit=%s\n" "$?" >&2
-    set -e
-    printf "DEBUG G: past set -e\n" >&2
-  fi
-  printf "DEBUG H: past if block\n" >&2
+      set +e
+      git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
+      git config --remove-section "submodule.${name}" 2>/dev/null
+      set -e
+    fi
 
   # Update .gitmodules: either delete the file entirely if no submodules
   # remain or stage the updated version.
@@ -347,7 +339,10 @@ remove_submodule_registration() {
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     # wc -l returns 0 on empty input; tr -d strips BSD/macOS leading whitespace.
     local remaining
-    remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
+    # git config exits 1 when no keys match; under pipefail this kills the script
+    # even though wc -l would handle empty input fine. Wrap in a subshell with
+    # set +o pipefail so only the final command's exit code matters.
+    remaining="$(set +o pipefail; git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$remaining" -eq 0 ]]; then
       # Use git rm if tracked, plain rm if not (e.g. left empty by a prior deinit).
       # git rm -f on an untracked file exits non-zero and kills the script.
