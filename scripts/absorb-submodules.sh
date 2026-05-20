@@ -331,8 +331,12 @@ remove_gitconfig_sections() {
     return 0
   fi
 
-  git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null || true
-  git config --remove-section "submodule.${name}" 2>/dev/null || true
+  # Use a subshell with "; true" to unconditionally suppress non-zero exits.
+  # "|| true" is not sufficient under set -e: the shell may trigger ERR before
+  # evaluating the || operator when the failing command is inside a function.
+  # A subshell ending in "; true" always exits 0, which set -e cannot catch.
+  (git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null; true)
+  (git config --remove-section "submodule.${name}" 2>/dev/null; true)
 }
 
 remove_submodule_registration() {
