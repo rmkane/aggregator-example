@@ -17,6 +17,7 @@
 #   ./scripts/absorb-submodules.sh absorb --submodule my-lib
 #
 # Requirements
+#   - Bash 3.2 or newer (macOS /bin/bash 3.2 and Bash 4.x are both supported)
 #   - Run from the repository root, or any path inside it
 #   - Clean working tree with no uncommitted changes
 #   - Network access to submodule remotes (unless already fetched)
@@ -51,6 +52,20 @@
 # =============================================================================
 set -euo pipefail
 
+# Bash 3.2+ is required. Avoid Bash 4-only features (e.g. associative arrays) so
+# the script runs on macOS /bin/bash 3.2 as well as modern Linux/bash 5.x.
+require_bash_3_2() {
+  if [[ -z "${BASH_VERSION:-}" ]]; then
+    printf '%s\n' "Error: this script must be run with bash." >&2
+    exit 1
+  fi
+  if ((BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2))); then
+    printf '%s\n' "Error: bash 3.2+ required (found ${BASH_VERSION})." >&2
+    exit 1
+  fi
+}
+require_bash_3_2
+
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
@@ -83,6 +98,7 @@ Options:
   -h, --help              Show this help
 
 Notes:
+  - Requires bash 3.2+ (macOS /bin/bash and bash 4.x are supported).
   - Default import uses the gitlink SHA at HEAD, not the branch in .gitmodules.
   - Creates one commit per submodule. Requires a clean working tree.
   - Verify history with: git log --all -- <path>/
@@ -131,11 +147,17 @@ current_branch() {
 
 submodule_names() {
   [[ -f .gitmodules ]] || return 0
-  # Parse config keys (handles submodule names that contain dots, e.g. foo.bar).
-  local key
+  # Parse config keys via prefix/suffix strips (Bash 3.2-safe; handles dots in names).
+  # Avoids =~ with BASH_REMATCH, which can behave inconsistently on Bash 3.2.
+  local key name
   while IFS= read -r key; do
-    [[ "$key" =~ ^submodule\.(.+)\.path$ ]] || continue
-    printf '%s\n' "${BASH_REMATCH[1]}"
+    case "$key" in
+      submodule.*.path)
+        name="${key#submodule.}"
+        name="${name%.path}"
+        printf '%s\n' "$name"
+        ;;
+    esac
   done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..+\.path$' 2>/dev/null || true)
 }
 
@@ -477,17 +499,25 @@ main() {
   # Cache submodule paths before any absorption begins. absorb_one removes each
   # submodule's entry from .gitmodules and may delete the file entirely once the
   # last submodule is absorbed. Reading paths post-absorption would silently
-  # fall back to the submodule *name* instead of its *path*, producing wrong
-  # `git log` hints in the final summary.
-  declare -A SUBMODULE_PATHS
-  for name in "${names[@]}"; do
-    SUBMODULE_PATHS["$name"]="$(submodule_path "$name")"
-  done
-
+  # produce the submodule *name* instead of its *path*, corrupting the final
+  # `git log` hints.
+  #
+  # Implemented as parallel indexed arrays (names[i] -> paths[i]) rather than
+  # an associative array because associative arrays require Bash 4+, and macOS
+  # ships /bin/bash at 3.2. Parallel arrays are the standard Bash 3.2-safe
+  # substitute and are sufficient here since nothing needs name-keyed lookup
+  # after the absorption loop. If this script is ever restricted to Bash 4+
+  # environments, replace with:
+  #   declare -A SUBMODULE_PATHS
+  #   SUBMODULE_PATHS["$name"]="$(submodule_path "$name")"
+  #   paths+=("${SUBMODULE_PATHS[$name]}")
   local paths=()
   for name in "${names[@]}"; do
+    paths+=("$(submodule_path "$name")")
+  done
+
+  for name in "${names[@]}"; do
     absorb_one "$name"
-    paths+=("${SUBMODULE_PATHS[$name]}")
   done
 
   log ""
