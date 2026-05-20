@@ -67,8 +67,6 @@
 #   See https://www.shellcheck.net for installation instructions.
 # =============================================================================
 set -euo pipefail
-# Trap to report the exact line number on unexpected exit — remove after debugging.
-trap 'echo "DIED at line ${LINENO}: exit $?" >&2' ERR
 
 # Bash 3.2+ is required. Avoid Bash 4-only features (e.g. associative arrays) so
 # the script runs on macOS /bin/bash 3.2 as well as modern Linux/bash 5.x.
@@ -333,12 +331,13 @@ remove_gitconfig_sections() {
     return 0
   fi
 
-  # Use a subshell with "; true" to unconditionally suppress non-zero exits.
-  # "|| true" is not sufficient under set -e: the shell may trigger ERR before
-  # evaluating the || operator when the failing command is inside a function.
-  # A subshell ending in "; true" always exits 0, which set -e cannot catch.
-  (git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null; true)
-  (git config --remove-section "submodule.${name}" 2>/dev/null; true)
+  # Temporarily disable set -e around these calls. Both || true and subshell
+  # "; true" patterns are unreliable under Bash 3.2 set -e inside functions.
+  # Explicitly toggling errexit is the only portable guarantee.
+  set +e
+  git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
+  git config --remove-section "submodule.${name}" 2>/dev/null
+  set -e
 }
 
 remove_submodule_registration() {
@@ -349,30 +348,24 @@ remove_submodule_registration() {
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
 
-  log "DEBUG: checking .gitmodules existence" >&2
   # Update .gitmodules: remove this submodule's section, then either delete
   # the file entirely if no submodules remain or stage the updated version.
   if [[ -f .gitmodules ]]; then
-    log "DEBUG: .gitmodules exists, calling remove_gitconfig_sections" >&2
     remove_gitconfig_sections "$name"
-    log "DEBUG: remove_gitconfig_sections returned $?" >&2
 
     # Count remaining submodule.* keys (not sections); delete .gitmodules when none.
     # wc -l returns 0 on empty input; tr -d strips BSD/macOS leading whitespace.
     local remaining
     remaining="$(git config -f .gitmodules --get-regexp '^submodule\.' 2>/dev/null | wc -l | tr -d ' ')"
-    log "DEBUG: remaining=$remaining" >&2
     if [[ "$remaining" -eq 0 ]]; then
       run_cmd git rm -f .gitmodules
     else
       run_cmd git add .gitmodules
     fi
   else
-    log "DEBUG: .gitmodules does not exist, calling remove_gitconfig_sections" >&2
     # .gitmodules already gone (deinit removed it); still clean up .git/config.
     remove_gitconfig_sections "$name"
   fi
-  log "DEBUG: remove_submodule_registration done" >&2
 }
 
 
