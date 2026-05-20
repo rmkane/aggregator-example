@@ -459,8 +459,8 @@ EOF
 
 parse_args() {
   [[ $# -eq 0 ]] && {
-    usage
-    exit 0
+    usage_short
+    exit 1
   }
 
   while [[ $# -gt 0 ]]; do
