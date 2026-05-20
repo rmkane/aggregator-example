@@ -323,21 +323,23 @@ remove_submodule_registration() {
   run_cmd git submodule deinit -f "$path"
   run_cmd git rm -f "$path"
   run_cmd rm -rf ".git/modules/${path}"
-  printf "DEBUG line %s: past rm -rf\n" "${LINENO}" >&2
-
-  # Remove submodule sections from .gitmodules and .git/config.
-  # deinit often removes these sections first so "missing section" is normal.
-  # set +e / set -e is used directly here — || true, subshell "; true", and
-  # set +e inside a called function are all unreliable under Bash 3.2 set -e.
+  printf "DEBUG A: past rm -rf\n" "${LINENO}" >&2
   if $DRY_RUN; then
+    printf "DEBUG B: dry-run branch\n" >&2
     log "[dry-run] git config -f .gitmodules --remove-section submodule.${name}"
     log "[dry-run] git config --remove-section submodule.${name}"
   else
+    printf "DEBUG C: about to set +e\n" >&2
     set +e
+    printf "DEBUG D: about to git config .gitmodules\n" >&2
     git config -f .gitmodules --remove-section "submodule.${name}" 2>/dev/null
+    printf "DEBUG E: about to git config .git/config, exit=%s\n" "$?" >&2
     git config --remove-section "submodule.${name}" 2>/dev/null
+    printf "DEBUG F: about to set -e, exit=%s\n" "$?" >&2
     set -e
+    printf "DEBUG G: past set -e\n" >&2
   fi
+  printf "DEBUG H: past if block\n" >&2
 
   # Update .gitmodules: either delete the file entirely if no submodules
   # remain or stage the updated version.
